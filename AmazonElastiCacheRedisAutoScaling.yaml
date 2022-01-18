@@ -1,0 +1,467 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Creates resources necessary to demonstrate Amazon ElastiCache for Redis Auto Scaling"
+Parameters:
+  CustomerS3Bucket:
+    Type: String
+    Description: "Customer S3 bucket where scripts are located at"
+  VPCCIDR:
+    Type: String
+    Description: VPC CIDR
+    Default: '10.0.0.0/26'
+  PrivateSubnetOneCIDR:
+    Type: String
+    Description: Subnet One CIDR
+    Default: '10.0.0.0/28'
+  PrivateSubnetTwoCIDR:
+    Type: String
+    Description: Subnet One CIDR
+    Default: '10.0.0.16/28'
+  PublicSubnetOneCIDR:
+    Type: String
+    Description: Public Subnet One CIDR
+    Default: '10.0.0.32/28'
+  RedisCacheNodeType:
+    Description: "The compute and memory capacity of the nodes in the node group"
+    Type: String
+    Default: cache.r5.large
+    AllowedValues:
+      - cache.r5.large
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: r5.4xlarge
+    AllowedValues:
+      - r5.4xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+Mappings:
+  AWSRegion2AMI:
+    ap-northeast-1:
+      HVM64: ami-0404778e217f54308
+    ap-northeast-2:
+      HVM64: ami-003ef1c0e2776ea27
+    ap-northeast-3:
+      HVM64: ami-0757d9e44f1490914
+    ap-south-1:
+      HVM64: ami-0108d6a82a783b352
+    ap-southeast-1:
+      HVM64: ami-03326c3f2f37e56a4
+    ap-southeast-2:
+      HVM64: ami-0c9f90931dd48d1f2
+    ca-central-1:
+      HVM64: ami-09321d7714bae0aab
+    eu-central-1:
+      HVM64: ami-0bd99ef9eccfee250
+    eu-north-1:
+      HVM64: ami-09733597242dc581b
+    eu-west-1:
+      HVM64: ami-09ce2fc392a4c0fbc
+    eu-west-2:
+      HVM64: ami-0c0a1cc13a52a158f
+    eu-west-3:
+      HVM64: ami-00bf323ac99d8bbbb
+    sa-east-1:
+      HVM64: ami-02edf5731752693cc
+    us-east-1:
+      HVM64: ami-04902260ca3d33422
+    us-east-2:
+      HVM64: ami-0d718c3d715cec4a7
+    us-west-1:
+      HVM64: ami-0d5075a2643fdf738
+    us-west-2:
+      HVM64: ami-0142f6ace1c558c7d
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId:
+        Fn::FindInMap:
+          - AWSRegion2AMI
+          - Ref: AWS::Region
+          - HVM64
+      InstanceType:
+        Ref: InstanceType
+      UserData:
+        Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            yum install -y gcc jemalloc-devel openssl-devel tcl tcl-devel clang wget
+            wget http://download.redis.io/redis-stable.tar.gz
+            tar xvzf redis-stable.tar.gz
+            cd redis-stable
+            CC=clang make BUILD_TLS=yes
+            pip3 install redis-py-cluster boto3 requests
+      Tags:
+        - Key: Name
+          Value: 'RedisAutoScalingDemo'
+      NetworkInterfaces:
+      - AssociatePublicIpAddress: 'true'
+        DeleteOnTermination: 'true'
+        DeviceIndex: 0
+        SubnetId: !Ref PublicSubnetOne
+        GroupSet:
+        - Ref: EC2SecurityGroup
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: EC2 Security group
+
+  EC2SecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: To download updates and communicate with resources
+      GroupId: !Ref EC2SecurityGroup
+      CidrIp: 0.0.0.0/0
+      IpProtocol: -1
+      FromPort: 0
+      ToPort: 65535
+
+  VPCFlowLogsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ""
+            Effect: "Allow"
+            Principal:
+              Service: "vpc-flow-logs.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "vpc-flow-logs-redis"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogGroups"
+                  - "logs:DescribeLogStreams"
+                Resource: !GetAtt VPCFlowLogsGroupRedis.Arn
+
+  EC2SSMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ""
+            Effect: "Allow"
+            Principal:
+              Service: "ec2.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: RedisDemo-Inline
+          PolicyDocument: !Sub |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "AllowS3GetObject",
+                  "Effect": "Allow",
+                  "Action": "s3:GetObject",
+                  "Resource": "arn:${AWS::Partition}:s3:::${CustomerS3Bucket}/*"
+                },
+                {
+                  "Sid": "GetRedisSecretValue",
+                  "Effect": "Allow",
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Resource": "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/redisdemo/redissecret*"
+                }
+              ]
+            }
+
+  EC2InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+        -
+          Ref: "EC2SSMRole"
+
+  FlowLogsRedisLogKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: An symmetric CMK for encrypting flow logs
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: keyForFlowLogs
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action: kms:*
+          Resource: '*'
+        - Sid: Allow log encryption
+          Effect: Allow
+          Principal:
+            Service: !Sub logs.${AWS::Region}.amazonaws.com
+          Action:
+            - kms:Encrypt*
+            - kms:Decrypt*
+            - kms:ReEncrypt*
+            - kms:GenerateDataKey*
+            - kms:Describe*
+          Resource: '*'
+          Condition:
+            ArnLike:
+              kms:EncryptionContext:aws:logs:arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !Ref VPCCIDR
+      Tags:
+        - Key: Name
+          Value: 'Redis-AutoScaling-VPC'
+
+  VPCFlowLogsGroupRedis:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: "VPCFlowLogsRedis"
+      KmsKeyId: !GetAtt FlowLogsRedisLogKey.Arn
+      RetentionInDays: 7
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      LogGroupName: "VPCFlowLogsRedis"
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+
+  RedisLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: "/aws/elasticache/redis-log-group"
+      KmsKeyId: !GetAtt FlowLogsRedisLogKey.Arn
+      RetentionInDays: 7
+
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref 'VPC'
+      CidrBlock: !Ref PrivateSubnetOneCIDR
+      Tags:
+        - Key: Name
+          Value: 'Private Subnet One'
+
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 1
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref 'VPC'
+      CidrBlock: !Ref PrivateSubnetTwoCIDR
+      Tags:
+        - Key: Name
+          Value: 'Private Subnet Two'
+
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref 'VPC'
+      CidrBlock: !Ref PublicSubnetOneCIDR
+      AvailabilityZone: !Select
+        - 1
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      Tags:
+      - Key: Name
+        Value: 'Public Subnet One'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Join:
+          - "-"
+          - - Ref: AWS::StackName
+            - InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref 'VPC'
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Join:
+          - "-"
+          - - Ref: AWS::StackName
+            - PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: 'Redis Route Table'
+
+  PrivateSubnetOneRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnetOne
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetTwoRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnetTwo
+      RouteTableId: !Ref PrivateRouteTable
+
+  RedisSecretsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: An symmetric CMK for Secrets Manager
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: keyForSecrets
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS:
+              - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+              - !GetAtt EC2SSMRole.Arn
+          Action: kms:*
+          Resource: '*'
+
+  RedisSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: /redisdemo/redissecret
+      Description: Generates random value for db password and stores in secrets manager
+      KmsKeyId: !Ref RedisSecretsKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 20
+        ExcludePunctuation: true
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis Security Group
+      VpcId: !Ref 'VPC'
+
+  RedisSecurityGroupIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow EC2 Instance to connect to Redis
+      GroupId: !Ref RedisSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !GetAtt EC2SecurityGroup.GroupId
+
+  RedisSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: To communicate within the SG
+      GroupId: !Ref RedisSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 0
+      ToPort: 0
+      DestinationSecurityGroupId: !GetAtt RedisSecurityGroup.GroupId
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Redis Subnet Group
+      SubnetIds: [!Ref PrivateSubnetOne, !Ref PrivateSubnetTwo]
+
+  RedisReplicationGroup:
+    Type: 'AWS::ElastiCache::ReplicationGroup'
+    DependsOn: RedisSecret
+    Properties:
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      LogDeliveryConfigurations:
+        - DestinationDetails:
+            CloudWatchLogsDetails:
+              LogGroup: !Ref RedisLogGroup
+          DestinationType: 'cloudwatch-logs'
+          LogFormat: 'json'
+          LogType: 'slow-log'
+      AuthToken: !Sub '{{resolve:secretsmanager:${RedisSecret}::password}}'
+      ReplicationGroupDescription: Redis Replication Group
+      NumNodeGroups: 3
+      AutomaticFailoverEnabled: 'true'
+      Engine: redis
+      ReplicationGroupId: 'redisautoscalingrg'
+      CacheNodeType: !Ref RedisCacheNodeType
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds: [!Ref RedisSecurityGroup]
+      Tags:
+        - Key: Name
+          Value: 'RedisCluster'
+
+  RedisAutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 10
+      MinCapacity: 3
+      ResourceId: !Sub 'replication-group/${RedisReplicationGroup}'
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/elasticache.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ElastiCacheRG
+      ScalableDimension: 'elasticache:replication-group:NodeGroups'
+      ServiceNamespace: 'elasticache'
+
+  RedisAutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: 'redis-auto-scaling-demo'
+      PolicyType: 'TargetTrackingScaling'
+      ScalingTargetId: !Ref RedisAutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 35
+        PredefinedMetricSpecification:
+          PredefinedMetricType: 'ElastiCachePrimaryEngineCPUUtilization'
+
+Outputs:
+  RedisClusterEndpoint:
+    Description: ElastiCache for Redis Cluster Endpoint
+    Value: !GetAtt RedisReplicationGroup.ConfigurationEndPoint.Address
+
+  SecretArn:
+    Description: Secret Key ARN
+    Value: !Ref RedisSecret
